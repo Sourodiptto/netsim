@@ -126,13 +126,78 @@ describe('terrain profiles', () => {
   it('measures effective antenna height above the surrounding terrain', () => {
     const plateau = () => 600;
     const profile = buildProfile(mumbai, pune, plateau, 32);
-    expect(effectiveAntennaHeight(profile, 640)).toBeCloseTo(40, 0);
+    for (const method of ['spot', 'mean-terrain', 'least-squares'] as const) {
+      expect(effectiveAntennaHeight(profile, 640, method)).toBeCloseTo(40, 0);
+    }
   });
 
   it('floors effective antenna height at 1 m for a mast in a valley', () => {
     const highGround = () => 1000;
     const profile = buildProfile(mumbai, pune, highGround, 32);
-    expect(effectiveAntennaHeight(profile, 500)).toBe(1);
+    expect(effectiveAntennaHeight(profile, 500, 'mean-terrain')).toBe(1);
+  });
+
+  it('only spot height is immune to double-counting a downrange ridge', () => {
+    // A mast on flat ground with a 400 m ridge halfway down the path. The
+    // ridge lifts both the mean and the fitted intercept, so mean-terrain and
+    // least-squares both charge for ground the diffraction term is already
+    // accounting for. spot does not. This is the trap documented on the
+    // function, asserted so it cannot be quietly "fixed" the wrong way.
+    const ridge = (latDeg: number): number => {
+      const d = Math.abs(latDeg - 18.8) / 0.02;
+      return d >= 1 ? 0 : 400 * (1 - d * d);
+    };
+    const profile = buildProfile(mumbai, pune, ridge, 256);
+    const antennaAltM = 40;
+
+    const spot = effectiveAntennaHeight(profile, antennaAltM, 'spot');
+    const mean = effectiveAntennaHeight(profile, antennaAltM, 'mean-terrain');
+    const fitted = effectiveAntennaHeight(profile, antennaAltM, 'least-squares');
+
+    expect(spot).toBeCloseTo(40, 0);
+    expect(mean).toBeLessThan(spot);
+    // A mid-path peak moves the fit and the mean by nearly the same amount.
+    expect(Math.abs(fitted - mean)).toBeLessThan(5);
+  });
+
+  it('gives least-squares the most leverage to a peak near a terminal', () => {
+    // The counter-intuitive one, pinned so nobody "optimises" it away. The
+    // intercept is an extrapolation to the path end, and in a linear fit the
+    // extreme points dominate it. A 500 m ridge near the far terminal tilts
+    // the line and pushes the intercept *below* the real ground, inflating
+    // h_eff rather than deflating it -- an error in the opposite direction
+    // from the mean's, and a larger one.
+    const farRidge = (latDeg: number): number => {
+      const d = Math.abs(latDeg - 18.56) / 0.03;
+      return d >= 1 ? 0 : 500 * (1 - d * d);
+    };
+    const profile = buildProfile(mumbai, pune, farRidge, 256);
+    const antennaAltM = 40;
+
+    const spot = effectiveAntennaHeight(profile, antennaAltM, 'spot');
+    const mean = effectiveAntennaHeight(profile, antennaAltM, 'mean-terrain');
+    const fitted = effectiveAntennaHeight(profile, antennaAltM, 'least-squares');
+
+    // The mean under-reads, the fit over-reads, and the fit errs further.
+    expect(mean).toBeLessThan(spot);
+    expect(fitted).toBeGreaterThan(spot);
+    expect(Math.abs(fitted - spot)).toBeGreaterThan(Math.abs(mean - spot));
+  });
+
+  it('tracks a consistent terrain slope with the least-squares datum', () => {
+    // Ground rising steadily along the path: the fit should recover the level
+    // under the transmitter, not the average over the whole path. Tolerance
+    // is metres rather than centimetres because latitude is only
+    // near-linear in great-circle distance.
+    const slope = (latDeg: number): number => (latDeg - 19.076) * -20_000;
+    const profile = buildProfile(mumbai, pune, slope, 128);
+    const atTx = profile.groundM[0]!;
+    const fitted = effectiveAntennaHeight(profile, atTx + 50, 'least-squares');
+    const mean = effectiveAntennaHeight(profile, atTx + 50, 'mean-terrain');
+
+    expect(Math.abs(fitted - 50)).toBeLessThan(15);
+    // The mean is dragged by the whole rising path and loses far more.
+    expect(Math.abs(mean - 50)).toBeGreaterThan(Math.abs(fitted - 50));
   });
 
   it('reports full Fresnel clearance for a high path over flat ground', () => {

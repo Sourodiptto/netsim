@@ -85,35 +85,123 @@ export function buildProfile(
 }
 
 /**
+ * How to reduce a terrain profile to the single "effective antenna height"
+ * the empirical models want.
+ *
+ *   spot          -- height above the ground directly under the mast. The
+ *                    honest geometric answer, and the only one that cannot
+ *                    double-count a downrange obstruction.
+ *   mean-terrain  -- height above mean terrain over a window of the path.
+ *                    The Standard Propagation Model and COST-231 convention,
+ *                    and what their coefficients were fitted against.
+ *   least-squares -- height above a straight line fitted through the profile,
+ *                    evaluated at the mast. Recovers the right datum over
+ *                    uniformly tilted ground, which is what the height-gain
+ *                    term is really reaching for. But see the leverage
+ *                    warning below: it is the least robust of the three to an
+ *                    isolated peak.
+ */
+export type EffectiveHeightMethod = 'spot' | 'mean-terrain' | 'least-squares';
+
+/**
  * Effective antenna height above the dominant terrain, metres.
  *
  * Empirical macro-cell models all take a base-station height, but they mean
  * height above the surrounding terrain, not above sea level or above the mast
  * foundation. Feeding them the wrong one is a classic error worth tens of
- * decibels over hilly ground. This uses the mean terrain over the middle
- * portion of the path, which is the convention the Standard Propagation Model
- * and COST-231 calibrations were fitted against.
+ * decibels over hilly ground.
+ *
+ * Why three methods rather than one: mean-terrain is the published SPM
+ * convention, but when high ground dominates the window it pulls the datum up
+ * and the mast ends up nominally *below* the terrain it is standing on. The
+ * model then charges for that obstruction twice -- once by collapsing h_eff
+ * toward its floor, and again through the diffraction term, which is already
+ * accounting for the same ground. Over a tall ridge that compounds into tens
+ * of spurious decibels, and it is the most likely explanation when a
+ * prediction over hilly terrain comes out absurdly pessimistic.
+ *
+ * Note what least-squares does and does not fix, because the intuition here
+ * is backwards. It recovers the correct datum over uniformly sloping ground,
+ * where the mean is dragged by the whole tilted path. It does *not* tame an
+ * isolated peak:
+ *
+ *   - A symmetric mid-path bump lifts the fitted intercept by very nearly the
+ *     same amount it lifts the mean, so the two agree.
+ *   - A peak near either terminal moves the fit *more* than it moves the
+ *     mean, not less. The intercept is an extrapolation to the path end, and
+ *     in a linear fit the extreme points carry the most leverage over it. A
+ *     500 m ridge near the far terminal tilts the line and pushes the
+ *     intercept below the real ground, inflating h_eff instead of deflating
+ *     it.
+ *
+ * So the only method that structurally cannot double-count downrange terrain
+ * is spot, and the only one with a published calibration behind it is
+ * mean-terrain. least-squares is for consistently tilted ground and should be
+ * reached for knowingly.
+ *
+ * The default stays mean-terrain because that is the convention the SPM and
+ * COST-231 coefficients were calibrated against, and silently predicting
+ * against a different datum than the model was fitted with would invalidate
+ * the calibration anchor the test suite checks. Commercial tools expose the
+ * same choice for the same reason; choosing is a calibration decision.
  *
  * Floored at 1 m because the empirical models take log(h_b) and would
- * otherwise diverge for a mast sitting below the local mean.
+ * otherwise diverge.
  */
 export function effectiveAntennaHeight(
   profile: TerrainProfile,
   antennaAltM: number,
-  windowStart = 0.1,
-  windowEnd = 0.9,
+  method: EffectiveHeightMethod = 'mean-terrain',
+  window: { start?: number; end?: number } = {},
 ): number {
   const n = profile.groundM.length;
+  if (n === 0) return Math.max(1, antennaAltM);
+
+  if (method === 'spot') {
+    return Math.max(1, antennaAltM - profile.groundM[0]!);
+  }
+
+  const windowStart = window.start ?? 0.1;
+  const windowEnd = window.end ?? 0.9;
   const lo = Math.max(0, Math.floor(n * windowStart));
   const hi = Math.min(n - 1, Math.ceil(n * windowEnd));
-  let sum = 0;
+
+  if (method === 'mean-terrain') {
+    let sum = 0;
+    let count = 0;
+    for (let i = lo; i <= hi; i++) {
+      sum += profile.groundM[i]!;
+      count++;
+    }
+    const meanTerrain = count > 0 ? sum / count : 0;
+    return Math.max(1, antennaAltM - meanTerrain);
+  }
+
+  // Least squares: fit ground = a + b*distance, then take the fitted ground
+  // level under the mast. Evaluating the fit at the transmitter rather than
+  // averaging it is what keeps a distant peak from inflating the datum.
+  let sumX = 0;
+  let sumY = 0;
+  let sumXy = 0;
+  let sumXx = 0;
   let count = 0;
   for (let i = lo; i <= hi; i++) {
-    sum += profile.groundM[i]!;
+    const x = profile.distancesM[i]!;
+    const y = profile.groundM[i]!;
+    sumX += x;
+    sumY += y;
+    sumXy += x * y;
+    sumXx += x * x;
     count++;
   }
-  const meanTerrain = count > 0 ? sum / count : 0;
-  return Math.max(1, antennaAltM - meanTerrain);
+  if (count < 2) return Math.max(1, antennaAltM - (profile.groundM[0] ?? 0));
+
+  const denominator = count * sumXx - sumX * sumX;
+  const slope = denominator === 0 ? 0 : (count * sumXy - sumX * sumY) / denominator;
+  const intercept = (sumY - slope * sumX) / count;
+  const fittedGroundAtTx = intercept;
+
+  return Math.max(1, antennaAltM - fittedGroundAtTx);
 }
 
 /**
